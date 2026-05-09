@@ -1,5 +1,68 @@
 # CHANGELOG
 
+## [v0.24.7] - 2026-05-09
+
+### What's Changed
+
+- ✨ Add reviewer provider selection (#63) (3292128)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.6...v0.24.7
+
+
+## [v0.24.6] - 2026-05-09
+
+### What's Changed
+
+- Add adaptive rate limiting (#62) (5465fae)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.5...v0.24.6
+
+
+## [v0.24.5] - 2026-05-09
+
+### What's Changed
+
+- Add durable knowledge recording prompt (#61) (8181191)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.4...v0.24.5
+
+
+## [v0.24.4] - 2026-05-09
+
+### What's Changed
+
+- Add health-based stall stopping (#60) (e514ef8)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.3...v0.24.4
+
+
+## [v0.24.3] - 2026-05-09
+
+### What's Changed
+
+- Retry transient commit and PR commands (#59) (4dc7c71)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.2...v0.24.3
+
+
+## [v0.24.2] - 2026-05-09
+
+### What's Changed
+
+- Surface PR merge errors accurately (#58) (e567f06)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.1...v0.24.2
+
+
+## [v0.24.1] - 2026-05-09
+
+### What's Changed
+
+- Add native PowerShell runner for Windows (#57) (28eacb4)
+
+**Full Changelog**: https://github.com/AnandChowdhary/continuous-claude/compare/v0.24.0...v0.24.1
+
+
 ## [v0.24.0] - 2026-05-09
 
 ### What's Changed

@@ -1,15 +1,17 @@
 #!/bin/bash
 # shellcheck disable=SC2155
 
-VERSION="v0.24.0"
+VERSION="v0.24.7"
 
 ADDITIONAL_FLAGS="--dangerously-skip-permissions --output-format stream-json --verbose"
 CODEX_ADDITIONAL_FLAGS="--json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check"
 
 NOTES_FILE="SHARED_TASK_NOTES.md"
+KNOWLEDGE_FILE=""
 AUTO_UPDATE=false
 DISABLE_UPDATES=false
 AGENT_PROVIDER="${CONTINUOUS_CLAUDE_PROVIDER:-claude}"
+REVIEW_PROVIDER=""
 CODEX_INPUT_COST_PER_MILLION="${CODEX_INPUT_COST_PER_MILLION:-}"
 CODEX_OUTPUT_COST_PER_MILLION="${CODEX_OUTPUT_COST_PER_MILLION:-}"
 CODEX_CACHED_INPUT_COST_PER_MILLION="${CODEX_CACHED_INPUT_COST_PER_MILLION:-}"
@@ -48,6 +50,20 @@ The file should NOT include:
 - Lists of completed work or full reports
 - Information that can be discovered by running tests/coverage
 - Unnecessary details"
+
+# shellcheck disable=SC2016
+PROMPT_KNOWLEDGE_UPDATE_EXISTING='Update the `$KNOWLEDGE_FILE` file with durable project knowledge learned during this iteration.'
+
+# shellcheck disable=SC2016
+PROMPT_KNOWLEDGE_CREATE_NEW='Create a `$KNOWLEDGE_FILE` file with durable project knowledge learned during this iteration.'
+
+PROMPT_KNOWLEDGE_GUIDELINES="
+
+This file is long-lived project memory for future AI and human developers. It should:
+
+- Capture reusable conventions, commands, architecture decisions, pitfalls, and style preferences
+- Stay laconic and information dense
+- Avoid per-iteration status logs, completed-work summaries, and facts that are easy to rediscover"
 
 PROMPT_REVIEWER_CONTEXT="## CODE REVIEW CONTEXT
 
@@ -110,7 +126,15 @@ LIST_WORKTREES=false
 DRY_RUN=false
 COMPLETION_SIGNAL="CONTINUOUS_CLAUDE_PROJECT_COMPLETE"
 COMPLETION_THRESHOLD=3
+STALL_THRESHOLD=""
+MAX_CALLS_PER_HOUR=""
+ERROR_THRESHOLD=3
 ERROR_LOG=""
+RATE_LIMIT_CALL_LOG=""
+RATE_LIMIT_ERROR_LOG=""
+RATE_LIMIT_COST_LOG=""
+RATE_LIMIT_WINDOW_SECONDS=3600
+RATE_LIMIT_DEFAULT_BACKOFF=300
 error_count=0
 extra_iterations=0
 successful_iterations=0
@@ -125,6 +149,8 @@ CI_RETRY_ENABLED=true
 CI_RETRY_MAX_ATTEMPTS=1
 COMMENT_REVIEW_ENABLED=true
 COMMENT_REVIEW_MAX_ATTEMPTS=1
+COMMAND_RETRY_MAX_ATTEMPTS=3
+COMMAND_RETRY_BASE_DELAY=5
 
 parse_duration() {
     # Parse a duration string like "2h", "30m", "1h30m", "90s" to seconds
@@ -221,6 +247,7 @@ OPTIONAL FLAGS:
     -h, --help                    Show this help message
     -v, --version                 Show version information
     --provider <provider>         AI coding agent provider: claude or codex (default: claude)
+    --review-provider <provider>  Provider for reviewer pass: claude or codex (defaults to --provider)
     --owner <owner>               GitHub repository owner (auto-detected from git remote if not provided)
     --repo <repo>                 GitHub repository name (auto-detected from git remote if not provided)
     --disable-commits             Disable automatic commits and PR creation
@@ -230,6 +257,7 @@ OPTIONAL FLAGS:
     --git-branch-prefix <prefix>  Branch prefix for iterations (default: "continuous-claude/")
     --merge-strategy <strategy>   PR merge strategy: squash, merge, or rebase (default: "squash")
     --notes-file <file>           Shared notes file for iteration context (default: "SHARED_TASK_NOTES.md")
+    --knowledge-file <file>       Durable project knowledge file to maintain (for example: "CLAUDE.md")
     --worktree <name>             Run in a git worktree for parallel execution (creates if needed)
     --worktree-base-dir <path>    Base directory for worktrees (default: "../continuous-claude-worktrees")
     --cleanup-worktree            Remove worktree after completion
@@ -238,6 +266,9 @@ OPTIONAL FLAGS:
     --dry-run                     Simulate execution without making changes
     --completion-signal <phrase>  Phrase that agents output when project is complete (default: "CONTINUOUS_CLAUDE_PROJECT_COMPLETE")
     --completion-threshold <num>  Number of consecutive signals to stop early (default: 3)
+    --stall-threshold <number>    Pause after N consecutive failures and write diagnostics to the notes file
+    --max-calls-per-hour <number> Throttle provider calls to this hourly ceiling
+    --error-threshold <number>    Consecutive non-rate-limit errors before exiting (default: 3)
     -r, --review-prompt [text]    Run a reviewer pass after each iteration to validate changes
                                   Uses a comprehensive default review prompt when text is omitted
                                   (e.g., run build/lint/tests and fix any issues)
@@ -245,6 +276,9 @@ OPTIONAL FLAGS:
     --ci-retry-max <number>       Maximum CI fix attempts per PR (default: 1)
     --disable-comment-review      Disable automatic PR comment review (enabled by default)
     --comment-review-max <number> Maximum comment review attempts per PR (default: 1)
+    --command-retry-max <number>  Maximum attempts for transient commit/push/PR-create commands (default: 3)
+    --command-retry-base-delay <seconds>
+                                  Initial retry delay for transient commands (default: 5)
     --codex-input-cost-per-million <dollars>
                                   Input token rate for Codex --max-cost estimates
     --codex-output-cost-per-million <dollars>
@@ -262,6 +296,9 @@ EXAMPLES:
 
     # Run 5 iterations with Codex CLI instead of Claude Code
     continuous-claude --provider codex -p "Fix all linter errors" -m 5 --owner myuser --repo myproject
+
+    # Use Claude Code for implementation and Codex CLI for review
+    continuous-claude --provider claude --review-provider codex -p "Add tests" -m 5 -r
 
     # Run with cost limit
     continuous-claude -p "Add tests" --max-cost 10.00 --owner myuser --repo myproject
@@ -342,7 +379,8 @@ show_version() {
 }
 
 get_agent_display_name() {
-    case "$AGENT_PROVIDER" in
+    local provider="${1:-$AGENT_PROVIDER}"
+    case "$provider" in
         claude)
             echo "Claude Code"
             ;;
@@ -350,13 +388,14 @@ get_agent_display_name() {
             echo "Codex CLI"
             ;;
         *)
-            echo "$AGENT_PROVIDER"
+            echo "$provider"
             ;;
     esac
 }
 
 get_agent_command() {
-    case "$AGENT_PROVIDER" in
+    local provider="${1:-$AGENT_PROVIDER}"
+    case "$provider" in
         claude)
             echo "claude"
             ;;
@@ -364,13 +403,14 @@ get_agent_command() {
             echo "codex"
             ;;
         *)
-            echo "$AGENT_PROVIDER"
+            echo "$provider"
             ;;
     esac
 }
 
 get_agent_install_url() {
-    case "$AGENT_PROVIDER" in
+    local provider="${1:-$AGENT_PROVIDER}"
+    case "$provider" in
         claude)
             echo "https://claude.ai/code"
             ;;
@@ -384,7 +424,8 @@ get_agent_install_url() {
 }
 
 get_agent_default_flags() {
-    case "$AGENT_PROVIDER" in
+    local provider="${1:-$AGENT_PROVIDER}"
+    case "$provider" in
         claude)
             echo "$ADDITIONAL_FLAGS"
             ;;
@@ -413,6 +454,11 @@ is_positive_number() {
 render_notes_prompt() {
     local template="$1"
     echo "${template//\$NOTES_FILE/$NOTES_FILE}"
+}
+
+render_knowledge_prompt() {
+    local template="$1"
+    echo "${template//\$KNOWLEDGE_FILE/$KNOWLEDGE_FILE}"
 }
 
 get_latest_version() {
@@ -852,6 +898,10 @@ parse_arguments() {
                 AGENT_PROVIDER="$2"
                 shift 2
                 ;;
+            --review-provider)
+                REVIEW_PROVIDER="$2"
+                shift 2
+                ;;
             --codex-input-cost-per-million)
                 CODEX_INPUT_COST_PER_MILLION="$2"
                 shift 2
@@ -908,6 +958,10 @@ parse_arguments() {
                 NOTES_FILE="$2"
                 shift 2
                 ;;
+            --knowledge-file)
+                KNOWLEDGE_FILE="$2"
+                shift 2
+                ;;
             --worktree)
                 WORKTREE_NAME="$2"
                 shift 2
@@ -934,6 +988,18 @@ parse_arguments() {
                 ;;
             --completion-threshold)
                 COMPLETION_THRESHOLD="$2"
+                shift 2
+                ;;
+            --stall-threshold)
+                STALL_THRESHOLD="$2"
+                shift 2
+                ;;
+            --max-calls-per-hour)
+                MAX_CALLS_PER_HOUR="$2"
+                shift 2
+                ;;
+            --error-threshold)
+                ERROR_THRESHOLD="$2"
                 shift 2
                 ;;
             --review-prompt=*)
@@ -971,6 +1037,14 @@ parse_arguments() {
                 COMMENT_REVIEW_MAX_ATTEMPTS="$2"
                 shift 2
                 ;;
+            --command-retry-max)
+                COMMAND_RETRY_MAX_ATTEMPTS="$2"
+                shift 2
+                ;;
+            --command-retry-base-delay)
+                COMMAND_RETRY_BASE_DELAY="$2"
+                shift 2
+                ;;
             *)
                 # Collect unknown flags to forward to the selected provider CLI.
                 add_extra_agent_flag "$1"
@@ -1006,6 +1080,11 @@ parse_update_flags() {
 validate_arguments() {
     if [[ ! "$AGENT_PROVIDER" =~ ^(claude|codex)$ ]]; then
         echo "❌ Error: --provider must be one of: claude, codex" >&2
+        exit 1
+    fi
+
+    if [ -n "$REVIEW_PROVIDER" ] && [[ ! "$REVIEW_PROVIDER" =~ ^(claude|codex)$ ]]; then
+        echo "❌ Error: --review-provider must be one of: claude, codex" >&2
         exit 1
     fi
 
@@ -1052,7 +1131,7 @@ validate_arguments() {
         exit 1
     fi
 
-    if [ "$AGENT_PROVIDER" = "codex" ] && [ -n "$MAX_COST" ]; then
+    if { [ "$AGENT_PROVIDER" = "codex" ] || { [ -n "$REVIEW_PROMPT" ] && [ "$REVIEW_PROVIDER" = "codex" ]; }; } && [ -n "$MAX_COST" ]; then
         if [ -z "$CODEX_INPUT_COST_PER_MILLION" ] || [ -z "$CODEX_OUTPUT_COST_PER_MILLION" ]; then
             echo "❌ Error: Codex CLI does not report USD cost. Use --codex-input-cost-per-million and --codex-output-cost-per-million with --max-cost." >&2
             exit 1
@@ -1081,6 +1160,27 @@ validate_arguments() {
         fi
     fi
 
+    if [ -n "$STALL_THRESHOLD" ]; then
+        if ! [[ "$STALL_THRESHOLD" =~ ^[0-9]+$ ]] || [ "$STALL_THRESHOLD" -lt 1 ]; then
+            echo "❌ Error: --stall-threshold must be a positive integer" >&2
+            exit 1
+        fi
+    fi
+
+    if [ -n "$MAX_CALLS_PER_HOUR" ]; then
+        if ! [[ "$MAX_CALLS_PER_HOUR" =~ ^[0-9]+$ ]] || [ "$MAX_CALLS_PER_HOUR" -lt 1 ]; then
+            echo "❌ Error: --max-calls-per-hour must be a positive integer" >&2
+            exit 1
+        fi
+    fi
+
+    if [ -n "$ERROR_THRESHOLD" ]; then
+        if ! [[ "$ERROR_THRESHOLD" =~ ^[0-9]+$ ]] || [ "$ERROR_THRESHOLD" -lt 1 ]; then
+            echo "❌ Error: --error-threshold must be a positive integer" >&2
+            exit 1
+        fi
+    fi
+
     if [ -n "$CI_RETRY_MAX_ATTEMPTS" ]; then
         if ! [[ "$CI_RETRY_MAX_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$CI_RETRY_MAX_ATTEMPTS" -lt 1 ]; then
             echo "❌ Error: --ci-retry-max must be a positive integer" >&2
@@ -1091,6 +1191,20 @@ validate_arguments() {
     if [ -n "$COMMENT_REVIEW_MAX_ATTEMPTS" ]; then
         if ! [[ "$COMMENT_REVIEW_MAX_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$COMMENT_REVIEW_MAX_ATTEMPTS" -lt 1 ]; then
             echo "❌ Error: --comment-review-max must be a positive integer" >&2
+            exit 1
+        fi
+    fi
+
+    if [ -n "$COMMAND_RETRY_MAX_ATTEMPTS" ]; then
+        if ! [[ "$COMMAND_RETRY_MAX_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$COMMAND_RETRY_MAX_ATTEMPTS" -lt 1 ]; then
+            echo "❌ Error: --command-retry-max must be a positive integer" >&2
+            exit 1
+        fi
+    fi
+
+    if [ -n "$COMMAND_RETRY_BASE_DELAY" ]; then
+        if ! [[ "$COMMAND_RETRY_BASE_DELAY" =~ ^[0-9]+$ ]]; then
+            echo "❌ Error: --command-retry-base-delay must be a non-negative integer" >&2
             exit 1
         fi
     fi
@@ -1132,20 +1246,34 @@ validate_arguments() {
 
 validate_requirements() {
     local agent_command
-    agent_command=$(get_agent_command)
+    agent_command=$(get_agent_command "$AGENT_PROVIDER")
     local agent_display
-    agent_display=$(get_agent_display_name)
+    agent_display=$(get_agent_display_name "$AGENT_PROVIDER")
     local install_url
-    install_url=$(get_agent_install_url)
+    install_url=$(get_agent_install_url "$AGENT_PROVIDER")
 
     if ! command -v "$agent_command" &> /dev/null; then
         echo "❌ Error: $agent_display is not installed: $install_url" >&2
         exit 1
     fi
 
+    if [ -n "$REVIEW_PROMPT" ] && [ -n "$REVIEW_PROVIDER" ]; then
+        local review_command
+        review_command=$(get_agent_command "$REVIEW_PROVIDER")
+        local review_display
+        review_display=$(get_agent_display_name "$REVIEW_PROVIDER")
+        local review_install_url
+        review_install_url=$(get_agent_install_url "$REVIEW_PROVIDER")
+
+        if ! command -v "$review_command" &> /dev/null; then
+            echo "❌ Error: reviewer provider $review_display is not installed: $review_install_url" >&2
+            exit 1
+        fi
+    fi
+
     if ! command -v jq &> /dev/null; then
         echo "⚠️ jq is required for JSON parsing but is not installed. Asking $agent_display to install it..." >&2
-        run_agent_prompt_quiet "$PROMPT_JQ_INSTALL" "setup"
+        run_agent_prompt_quiet "$PROMPT_JQ_INSTALL" "setup" >/dev/null 2>&1
         if ! command -v jq &> /dev/null; then
             echo "❌ Error: jq is still not installed after $agent_display attempt." >&2
             exit 1
@@ -1457,8 +1585,12 @@ merge_pr_and_cleanup() {
     esac
 
     echo "🔀 $iteration_display Merging PR #$pr_number with strategy: $MERGE_STRATEGY..." >&2
-    if ! gh pr merge "$pr_number" --repo "$owner/$repo" $merge_flag >/dev/null 2>&1; then
-        echo "⚠️  $iteration_display Failed to merge PR (may have conflicts or be blocked)" >&2
+    local merge_output
+    if ! merge_output=$(gh pr merge "$pr_number" --repo "$owner/$repo" $merge_flag 2>&1); then
+        echo "⚠️  $iteration_display Failed to merge PR: $merge_output" >&2
+        if echo "$merge_output" | grep -qi "upgrade to github pro\\|make this repository public\\|http 403\\|status code 403\\|resource not accessible"; then
+            echo "   GitHub reported an API or plan restriction. This is not a merge queue failure; check repository visibility, branch protection/ruleset availability, and your GitHub plan." >&2
+        fi
         return 1
     fi
 
@@ -1580,7 +1712,7 @@ continuous_claude_commit() {
     if [ "$has_uncommitted_changes" = "true" ]; then
         echo "💬 $iteration_display Committing changes..." >&2
         
-        if ! run_agent_prompt_quiet "$PROMPT_COMMIT_MESSAGE"; then
+        if ! run_with_command_retry "$iteration_display commit command" run_agent_prompt_quiet "$PROMPT_COMMIT_MESSAGE"; then
             echo "⚠️  $iteration_display Failed to commit changes" >&2
             git checkout "$main_branch" >/dev/null 2>&1
             return 1
@@ -1604,15 +1736,16 @@ continuous_claude_commit() {
     local commit_body=$(echo "$commit_message" | tail -n +4)
 
     echo "📤 $iteration_display Pushing branch..." >&2
-    if ! git push -u origin "$branch_name" >/dev/null 2>&1; then
-        echo "⚠️  $iteration_display Failed to push branch" >&2
+    local push_output
+    if ! push_output=$(run_with_command_retry "$iteration_display push branch" git push -u origin "$branch_name"); then
+        echo "⚠️  $iteration_display Failed to push branch: $push_output" >&2
         git checkout "$main_branch" >/dev/null 2>&1
         return 1
     fi
 
     echo "🔨 $iteration_display Creating pull request..." >&2
     local pr_output
-    if ! pr_output=$(gh pr create --repo "$GITHUB_OWNER/$GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch" 2>&1); then
+    if ! pr_output=$(run_with_command_retry "$iteration_display create PR" gh pr create --repo "$GITHUB_OWNER/$GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch"); then
         echo "⚠️  $iteration_display Failed to create PR: $pr_output" >&2
         git checkout "$main_branch" >/dev/null 2>&1
         return 1
@@ -1726,7 +1859,7 @@ commit_on_current_branch() {
 
     echo "💬 $iteration_display Committing changes on current branch..." >&2
 
-    if ! run_agent_prompt_quiet "$PROMPT_COMMIT_MESSAGE"; then
+    if ! run_with_command_retry "$iteration_display commit command" run_agent_prompt_quiet "$PROMPT_COMMIT_MESSAGE"; then
         echo "⚠️  $iteration_display Failed to commit changes" >&2
         return 1
     fi
@@ -1884,22 +2017,56 @@ run_agent_prompt_quiet() {
     local prompt="$1"
     local mode="${2:-git}"
 
+    record_agent_call "agent prompt"
+
     case "$AGENT_PROVIDER" in
         claude)
             local allowed_tools="Bash(git)"
             if [ "$mode" = "setup" ]; then
                 allowed_tools="Bash,Read"
             fi
-            claude -p "$prompt" --allowedTools "$allowed_tools" --dangerously-skip-permissions "${EXTRA_AGENT_FLAGS[@]}" >/dev/null 2>&1
+            claude -p "$prompt" --allowedTools "$allowed_tools" --dangerously-skip-permissions "${EXTRA_AGENT_FLAGS[@]}" >/dev/null
             ;;
         codex)
             # shellcheck disable=SC2086
-            codex exec $CODEX_ADDITIONAL_FLAGS -C "$PWD" "${EXTRA_AGENT_FLAGS[@]}" "$prompt" >/dev/null 2>&1
+            codex exec $CODEX_ADDITIONAL_FLAGS -C "$PWD" "${EXTRA_AGENT_FLAGS[@]}" "$prompt" >/dev/null
             ;;
         *)
             return 1
             ;;
     esac
+}
+
+run_with_command_retry() {
+    local label="$1"
+    shift
+
+    local attempt=1
+    local delay="${COMMAND_RETRY_BASE_DELAY:-5}"
+    local output=""
+    local exit_code=0
+
+    while [ "$attempt" -le "$COMMAND_RETRY_MAX_ATTEMPTS" ]; do
+        if output=$("$@" 2>&1); then
+            printf "%s" "$output"
+            return 0
+        fi
+
+        exit_code=$?
+        if [ "$attempt" -ge "$COMMAND_RETRY_MAX_ATTEMPTS" ]; then
+            printf "%s" "$output"
+            return "$exit_code"
+        fi
+
+        echo "⚠️  $label failed (attempt $attempt/$COMMAND_RETRY_MAX_ATTEMPTS): $output" >&2
+        echo "⏳ Retrying $label in ${delay}s..." >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+
+    printf "%s" "$output"
+    return "$exit_code"
 }
 
 run_claude_provider_iteration() {
@@ -2204,6 +2371,7 @@ run_agent_iteration() {
     local error_log="$3"
     local iteration_display="$4"
 
+    record_agent_call "$iteration_display agent call"
     : > "$error_log"
 
     case "$AGENT_PROVIDER" in
@@ -2228,8 +2396,14 @@ run_reviewer_iteration() {
     local iteration_display="$1"
     local review_prompt="$2"
     local error_log="$3"
+    local provider="${REVIEW_PROVIDER:-$AGENT_PROVIDER}"
+    local original_provider="$AGENT_PROVIDER"
 
-    echo "🔍 $iteration_display Running reviewer pass..." >&2
+    AGENT_PROVIDER="$provider"
+    local reviewer_display
+    reviewer_display=$(get_agent_display_name "$provider")
+
+    echo "🔍 $iteration_display Running reviewer pass with $reviewer_display..." >&2
 
     # Build the reviewer prompt with context
     local full_reviewer_prompt="${PROMPT_REVIEWER_CONTEXT}
@@ -2241,10 +2415,11 @@ ${review_prompt}"
     # Run the selected provider with the reviewer prompt
     local result
     local agent_exit_code=0
-    result=$(run_agent_iteration "$full_reviewer_prompt" "$(get_agent_default_flags)" "$error_log" "$iteration_display") || agent_exit_code=$?
+    result=$(run_agent_iteration "$full_reviewer_prompt" "$(get_agent_default_flags "$provider")" "$error_log" "$iteration_display") || agent_exit_code=$?
 
     if [ $agent_exit_code -ne 0 ]; then
         echo "❌ $iteration_display Reviewer pass failed with exit code: $agent_exit_code" >&2
+        AGENT_PROVIDER="$original_provider"
         return 1
     fi
 
@@ -2252,6 +2427,7 @@ ${review_prompt}"
     local parse_result
     if ! parse_result=$(parse_agent_result "$result"); then
         echo "❌ $iteration_display Reviewer pass returned error: $parse_result" >&2
+        AGENT_PROVIDER="$original_provider"
         return 1
     fi
 
@@ -2260,6 +2436,7 @@ ${review_prompt}"
     if [ -n "$reviewer_cost" ]; then
         printf "💰 $iteration_display Reviewer cost: \$%.3f\n" "$reviewer_cost" >&2
         total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $reviewer_cost}")
+        record_rate_cost "$reviewer_cost"
         printf "   Running total: \$%.3f\n" "$total_cost" >&2
     fi
 
@@ -2270,6 +2447,7 @@ ${review_prompt}"
     fi
 
     echo "✅ $iteration_display Reviewer pass completed" >&2
+    AGENT_PROVIDER="$original_provider"
     return 0
 }
 
@@ -2334,6 +2512,7 @@ run_ci_fix_iteration() {
     if [ -n "$fix_cost" ]; then
         printf "💰 $iteration_display CI fix cost: \$%.3f\n" "$fix_cost" >&2
         total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $fix_cost}")
+        record_rate_cost "$fix_cost"
         printf "   Running total: \$%.3f\n" "$total_cost" >&2
     fi
 
@@ -2437,6 +2616,7 @@ run_comment_fix_iteration() {
     if [ -n "$fix_cost" ]; then
         printf "💰 $iteration_display Comment review cost: \$%.3f\n" "$fix_cost" >&2
         total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $fix_cost}")
+        record_rate_cost "$fix_cost"
         printf "   Running total: \$%.3f\n" "$total_cost" >&2
     fi
 
@@ -2608,6 +2788,333 @@ extract_agent_usage_summary() {
     '
 }
 
+ensure_rate_limit_logs() {
+    if [ -z "$RATE_LIMIT_CALL_LOG" ]; then
+        RATE_LIMIT_CALL_LOG=$(mktemp)
+    fi
+    if [ -z "$RATE_LIMIT_ERROR_LOG" ]; then
+        RATE_LIMIT_ERROR_LOG=$(mktemp)
+    fi
+    if [ -z "$RATE_LIMIT_COST_LOG" ]; then
+        RATE_LIMIT_COST_LOG=$(mktemp)
+    fi
+}
+
+prune_rate_log() {
+    local log_file="$1"
+    local now="$2"
+    local cutoff=$((now - RATE_LIMIT_WINDOW_SECONDS))
+
+    [ -n "$log_file" ] || return 0
+    [ -f "$log_file" ] || : > "$log_file"
+
+    awk -v cutoff="$cutoff" 'NF && $1 >= cutoff { print }' "$log_file" > "${log_file}.tmp"
+    mv "${log_file}.tmp" "$log_file"
+}
+
+count_rate_log() {
+    local log_file="$1"
+    [ -f "$log_file" ] || {
+        echo 0
+        return 0
+    }
+
+    awk 'NF { count++ } END { print count + 0 }' "$log_file"
+}
+
+sum_cost_rate_log() {
+    local log_file="$1"
+    [ -f "$log_file" ] || {
+        echo "0.000"
+        return 0
+    }
+
+    awk 'NF >= 2 { sum += $2 } END { printf "%.3f", sum + 0 }' "$log_file"
+}
+
+rate_limit_window_stats() {
+    ensure_rate_limit_logs
+
+    local now
+    now=$(date +%s)
+    prune_rate_log "$RATE_LIMIT_CALL_LOG" "$now"
+    prune_rate_log "$RATE_LIMIT_ERROR_LOG" "$now"
+    prune_rate_log "$RATE_LIMIT_COST_LOG" "$now"
+
+    printf "calls %s/hr, errors %s/hr, cost \$%s/hr" \
+        "$(count_rate_log "$RATE_LIMIT_CALL_LOG")" \
+        "$(count_rate_log "$RATE_LIMIT_ERROR_LOG")" \
+        "$(sum_cost_rate_log "$RATE_LIMIT_COST_LOG")"
+}
+
+record_rate_error() {
+    ensure_rate_limit_logs
+    local now
+    now=$(date +%s)
+    prune_rate_log "$RATE_LIMIT_ERROR_LOG" "$now"
+    echo "$now" >> "$RATE_LIMIT_ERROR_LOG"
+}
+
+record_rate_cost() {
+    local cost="$1"
+    [ -n "$cost" ] || return 0
+    ensure_rate_limit_logs
+    local now
+    now=$(date +%s)
+    prune_rate_log "$RATE_LIMIT_COST_LOG" "$now"
+    echo "$now $cost" >> "$RATE_LIMIT_COST_LOG"
+}
+
+record_agent_call() {
+    local label="${1:-agent call}"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        return 0
+    fi
+
+    ensure_rate_limit_logs
+
+    local now
+    now=$(date +%s)
+    prune_rate_log "$RATE_LIMIT_CALL_LOG" "$now"
+
+    if [ -n "$MAX_CALLS_PER_HOUR" ]; then
+        local call_count
+        call_count=$(count_rate_log "$RATE_LIMIT_CALL_LOG")
+        if [ "$call_count" -ge "$MAX_CALLS_PER_HOUR" ]; then
+            local oldest wait_seconds
+            oldest=$(awk 'NF { print $1; exit }' "$RATE_LIMIT_CALL_LOG")
+            wait_seconds=$((oldest + RATE_LIMIT_WINDOW_SECONDS - now))
+            if [ "$wait_seconds" -gt 0 ]; then
+                echo "⏱ $label throttled for $(format_duration "$wait_seconds") (limit ${MAX_CALLS_PER_HOUR}/hr; $(rate_limit_window_stats))" >&2
+                sleep "$wait_seconds"
+                now=$(date +%s)
+                prune_rate_log "$RATE_LIMIT_CALL_LOG" "$now"
+            fi
+        fi
+    fi
+
+    echo "$now" >> "$RATE_LIMIT_CALL_LOG"
+}
+
+seconds_until_time_today_or_tomorrow() {
+    local hour="$1"
+    local minute="${2:-0}"
+    local timezone="${3:-}"
+
+    local now_parts
+    if [ -n "$timezone" ]; then
+        now_parts=$(TZ="$timezone" date '+%H %M %S' 2>/dev/null || date '+%H %M %S')
+    else
+        now_parts=$(date '+%H %M %S')
+    fi
+
+    local now_hour now_minute now_second
+    read -r now_hour now_minute now_second <<< "$now_parts"
+
+    local now_seconds=$((10#$now_hour * 3600 + 10#$now_minute * 60 + 10#$now_second))
+    local target_seconds=$((10#$hour * 3600 + 10#$minute * 60))
+    local wait_seconds=$((target_seconds - now_seconds))
+    if [ "$wait_seconds" -le 0 ]; then
+        wait_seconds=$((wait_seconds + 86400))
+    fi
+
+    echo "$wait_seconds"
+}
+
+parse_reset_time_wait_seconds() {
+    local text="$1"
+    local reset_parts
+
+    reset_parts=$(printf "%s" "$text" | tr '\n' ' ' | sed -nE 's/.*resets([[:space:]]+at)?[[:space:]]+([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp][Mm])?[[:space:]]*(\(([^)]*)\))?.*/\2|\4|\5|\7/p' | head -n 1)
+    [ -n "$reset_parts" ] || return 1
+
+    local hour minute ampm timezone
+    IFS='|' read -r hour minute ampm timezone <<< "$reset_parts"
+    minute="${minute:-0}"
+
+    if [ -n "$ampm" ]; then
+        case "$(printf "%s" "$ampm" | tr '[:upper:]' '[:lower:]')" in
+            pm)
+                if [ "$hour" -lt 12 ]; then
+                    hour=$((hour + 12))
+                fi
+                ;;
+            am)
+                if [ "$hour" -eq 12 ]; then
+                    hour=0
+                fi
+                ;;
+        esac
+    fi
+
+    seconds_until_time_today_or_tomorrow "$hour" "$minute" "$timezone"
+}
+
+detect_rate_limit_wait_seconds() {
+    local text="$1"
+    local lower
+    lower=$(printf "%s" "$text" | tr '[:upper:]' '[:lower:]')
+
+    case "$lower" in
+        *"rate limit"*|*"rate_limit_error"*|*"too many requests"*|*"429"*|*"overloaded_error"*|*"temporarily overloaded"*|*"limit reached"*)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    local reset_wait
+    if reset_wait=$(parse_reset_time_wait_seconds "$text"); then
+        echo "$reset_wait"
+        return 0
+    fi
+
+    local retry_after
+    retry_after=$(printf "%s" "$lower" | grep -Eio 'retry[-_ ]?after[^0-9]{0,20}[0-9]+' | head -n 1 | grep -Eo '[0-9]+' | tail -n 1 || true)
+    if [ -n "$retry_after" ]; then
+        echo "$retry_after"
+        return 0
+    fi
+
+    local wait_match
+    wait_match=$(printf "%s" "$lower" | grep -Eio '(try again|retry|wait)[^0-9]{0,20}[0-9]+[[:space:]]*(seconds?|secs?|s|minutes?|mins?|m)' | head -n 1 || true)
+    if [ -n "$wait_match" ]; then
+        local amount unit
+        amount=$(printf "%s" "$wait_match" | grep -Eo '[0-9]+' | head -n 1)
+        unit=$(printf "%s" "$wait_match" | grep -Eio '(seconds?|secs?|s|minutes?|mins?|m)$' | head -n 1)
+        case "$unit" in
+            minute|minutes|min|mins|m)
+                echo $((amount * 60))
+                ;;
+            *)
+                echo "$amount"
+                ;;
+        esac
+        return 0
+    fi
+
+    echo "$RATE_LIMIT_DEFAULT_BACKOFF"
+    return 0
+}
+
+maybe_sleep_for_rate_limit() {
+    local iteration_display="$1"
+    local error_type="$2"
+    local details="${3:-}"
+
+    local error_details wait_seconds
+    error_details=$(get_recent_failure_details "$details")
+    if ! wait_seconds=$(detect_rate_limit_wait_seconds "$error_details"); then
+        return 1
+    fi
+
+    echo "⏱ $iteration_display Rate limit detected in $error_type; throttled for $(format_duration "$wait_seconds") ($(rate_limit_window_stats))" >&2
+    sleep "$wait_seconds"
+    error_count=0
+    return 0
+}
+
+repo_has_pending_changes() {
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty; then
+        return 0
+    fi
+
+    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+detect_positive_completion_heuristic() {
+    local result_text="$1"
+
+    if [ -z "$result_text" ]; then
+        return 1
+    fi
+
+    local normalized
+    normalized=$(printf "%s" "$result_text" | tr '[:upper:]' '[:lower:]')
+
+    case "$normalized" in
+        *"all scoped tasks complete"*|*"all requested tasks complete"*|*"all tasks complete"*|*"nothing left to do"*|*"no remaining work"*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+get_recent_failure_details() {
+    local fallback="${1:-}"
+
+    if [ -n "$ERROR_LOG" ] && [ -f "$ERROR_LOG" ] && [ -s "$ERROR_LOG" ]; then
+        tail -n 80 "$ERROR_LOG"
+    elif [ -n "$fallback" ]; then
+        printf "%s\n" "$fallback" | tail -n 80
+    else
+        echo "No diagnostics captured."
+    fi
+}
+
+append_stall_summary() {
+    local iteration_display="$1"
+    local reason="$2"
+    local details="${3:-}"
+
+    local notes_dir
+    notes_dir=$(dirname "$NOTES_FILE")
+    if [ "$notes_dir" != "." ]; then
+        mkdir -p "$notes_dir"
+    fi
+
+    {
+        echo ""
+        echo "## Health pause - $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo ""
+        echo "- Iteration: $iteration_display"
+        echo "- Consecutive failures: $error_count"
+        echo "- Reason: $reason"
+        echo ""
+        echo "Recent diagnostics:"
+        get_recent_failure_details "$details" | sed 's/^/    /'
+        echo ""
+        echo "Next step: Inspect the failure, fix the project or adjust the prompt, then rerun Continuous Claude."
+    } >> "$NOTES_FILE"
+}
+
+maybe_handle_stall_threshold() {
+    local iteration_display="$1"
+    local reason="$2"
+    local details="${3:-}"
+
+    if [ -n "$STALL_THRESHOLD" ] && [ "$error_count" -ge "$STALL_THRESHOLD" ]; then
+        append_stall_summary "$iteration_display" "$reason" "$details"
+        echo "⏸️  $iteration_display Health stall threshold reached ($error_count/$STALL_THRESHOLD consecutive failures)" >&2
+        echo "📝 $iteration_display Wrote stall diagnostics to $NOTES_FILE" >&2
+
+        if [ -t 0 ]; then
+            echo "Press Enter after human intervention to continue, or Ctrl+C to exit." >&2
+            read -r _
+            error_count=0
+            return 0
+        fi
+
+        echo "❌ $iteration_display Non-interactive shell detected; exiting so a human can intervene." >&2
+        exit 1
+    fi
+
+    if [ -z "$STALL_THRESHOLD" ] && [ "$error_count" -ge "$ERROR_THRESHOLD" ]; then
+        echo "❌ Fatal: $ERROR_THRESHOLD consecutive errors occurred. Exiting." >&2
+        exit 1
+    fi
+}
+
 handle_iteration_error() {
     local iteration_display="$1"
     local error_type="$2"
@@ -2615,6 +3122,7 @@ handle_iteration_error() {
     
     error_count=$((error_count + 1))
     extra_iterations=$((extra_iterations + 1))
+    record_rate_error
     
     case "$error_type" in
         "exit_code")
@@ -2660,10 +3168,11 @@ handle_iteration_error() {
             ;;
     esac
     
-    if [ "$error_count" -ge 3 ]; then
-        echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
-        exit 1
+    if maybe_sleep_for_rate_limit "$iteration_display" "$error_type" "$error_output"; then
+        return 1
     fi
+
+    maybe_handle_stall_threshold "$iteration_display" "$error_type" "$error_output"
     
     return 1
 }
@@ -2676,18 +3185,9 @@ handle_iteration_success() {
     
     local result_text
     result_text=$(extract_agent_result_text "$result")
-
-    # Check for completion signal in the output
+    local explicit_completion_detected=false
     if [ -n "$result_text" ] && [[ "$result_text" == *"$COMPLETION_SIGNAL"* ]]; then
-        completion_signal_count=$((completion_signal_count + 1))
-        echo "" >&2
-        echo "🎯 $iteration_display Completion signal detected ($completion_signal_count/$COMPLETION_THRESHOLD)" >&2
-    else
-        if [ "$completion_signal_count" -gt 0 ]; then
-            echo "" >&2
-            echo "🔄 $iteration_display Completion signal not found, resetting counter" >&2
-        fi
-        completion_signal_count=0
+        explicit_completion_detected=true
     fi
 
     local cost
@@ -2696,6 +3196,7 @@ handle_iteration_success() {
         echo "" >&2
         printf "💰 $iteration_display Iteration cost: \$%.3f\n" "$cost" >&2
         total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $cost}")
+        record_rate_cost "$cost"
         printf "   Running total: \$%.3f\n" "$total_cost" >&2
     fi
 
@@ -2712,11 +3213,12 @@ handle_iteration_success() {
             if ! commit_on_current_branch "$iteration_display"; then
                 error_count=$((error_count + 1))
                 extra_iterations=$((extra_iterations + 1))
+                record_rate_error
                 echo "❌ $iteration_display Commit failed ($error_count consecutive errors)" >&2
-                if [ "$error_count" -ge 3 ]; then
-                    echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
-                    exit 1
+                if maybe_sleep_for_rate_limit "$iteration_display" "commit failed"; then
+                    return 1
                 fi
+                maybe_handle_stall_threshold "$iteration_display" "commit failed"
                 return 1
             fi
         else
@@ -2724,11 +3226,12 @@ handle_iteration_success() {
             if ! continuous_claude_commit "$iteration_display" "$branch_name" "$main_branch"; then
                 error_count=$((error_count + 1))
                 extra_iterations=$((extra_iterations + 1))
-                echo "❌ $iteration_display PR merge queue failed ($error_count consecutive errors)" >&2
-                if [ "$error_count" -ge 3 ]; then
-                    echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
-                    exit 1
+                record_rate_error
+                echo "❌ $iteration_display PR workflow failed ($error_count consecutive errors)" >&2
+                if maybe_sleep_for_rate_limit "$iteration_display" "PR workflow failed"; then
+                    return 1
                 fi
+                maybe_handle_stall_threshold "$iteration_display" "PR workflow failed"
                 return 1
             fi
         fi
@@ -2739,6 +3242,22 @@ handle_iteration_success() {
             git checkout "$main_branch" >/dev/null 2>&1
             git branch -D "$branch_name" >/dev/null 2>&1 || true
         fi
+    fi
+
+    if [ "$explicit_completion_detected" = "true" ]; then
+        completion_signal_count=$((completion_signal_count + 1))
+        echo "" >&2
+        echo "🎯 $iteration_display Completion signal detected ($completion_signal_count/$COMPLETION_THRESHOLD)" >&2
+    elif detect_positive_completion_heuristic "$result_text" && ! repo_has_pending_changes; then
+        completion_signal_count=$((completion_signal_count + 1))
+        echo "" >&2
+        echo "🩺 $iteration_display Positive completion heuristic detected ($completion_signal_count/$COMPLETION_THRESHOLD)" >&2
+    else
+        if [ "$completion_signal_count" -gt 0 ]; then
+            echo "" >&2
+            echo "🔄 $iteration_display Completion signal not found, resetting counter" >&2
+        fi
+        completion_signal_count=0
     fi
     
     error_count=0
@@ -2791,6 +3310,18 @@ $notes_content
 "
     fi
 
+    if [ -n "$KNOWLEDGE_FILE" ] && [ -f "$KNOWLEDGE_FILE" ]; then
+        local knowledge_content
+        knowledge_content=$(cat "$KNOWLEDGE_FILE")
+        enhanced_prompt+="## DURABLE PROJECT KNOWLEDGE
+
+The following is from $KNOWLEDGE_FILE, maintained across iterations as long-lived project knowledge:
+
+$knowledge_content
+
+"
+    fi
+
     enhanced_prompt+="## ITERATION NOTES
 
 "
@@ -2802,6 +3333,21 @@ $notes_content
     fi
     
     enhanced_prompt+="$PROMPT_NOTES_GUIDELINES"
+
+    if [ -n "$KNOWLEDGE_FILE" ]; then
+        enhanced_prompt+="
+
+## DURABLE KNOWLEDGE RECORDING
+
+"
+        if [ -f "$KNOWLEDGE_FILE" ]; then
+            enhanced_prompt+="$(render_knowledge_prompt "$PROMPT_KNOWLEDGE_UPDATE_EXISTING")"
+        else
+            enhanced_prompt+="$(render_knowledge_prompt "$PROMPT_KNOWLEDGE_CREATE_NEW")"
+        fi
+
+        enhanced_prompt+="$PROMPT_KNOWLEDGE_GUIDELINES"
+    fi
 
     local agent_display
     agent_display=$(get_agent_display_name)
@@ -2846,10 +3392,11 @@ $notes_content
             # Count as an error for consecutive error tracking
             error_count=$((error_count + 1))
             extra_iterations=$((extra_iterations + 1))
-            if [ "$error_count" -ge 3 ]; then
-                echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
-                exit 1
+            record_rate_error
+            if maybe_sleep_for_rate_limit "$iteration_display" "reviewer failed"; then
+                return 1
             fi
+            maybe_handle_stall_threshold "$iteration_display" "reviewer failed"
             return 1
         fi
     fi
@@ -2961,7 +3508,10 @@ main() {
     setup_worktree
     
     ERROR_LOG=$(mktemp)
-    trap 'rm -f "$ERROR_LOG"; cleanup_worktree' EXIT
+    RATE_LIMIT_CALL_LOG=$(mktemp)
+    RATE_LIMIT_ERROR_LOG=$(mktemp)
+    RATE_LIMIT_COST_LOG=$(mktemp)
+    trap 'rm -f "$ERROR_LOG" "$RATE_LIMIT_CALL_LOG" "$RATE_LIMIT_ERROR_LOG" "$RATE_LIMIT_COST_LOG"; cleanup_worktree' EXIT
     
     main_loop
     show_completion_summary

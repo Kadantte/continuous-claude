@@ -87,6 +87,20 @@ This will:
 - Check for required dependencies
 - Guide you through adding it to your PATH if needed
 
+On Windows with PowerShell 7:
+
+```powershell
+irm https://raw.githubusercontent.com/AnandChowdhary/continuous-claude/main/install.ps1 | iex
+```
+
+This installs the native PowerShell runner as `continuous-claude.ps1`, so Windows users can run Continuous Claude without WSL or Git Bash:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude.ps1 --prompt "add unit tests until all code is covered" --max-runs 5
+```
+
+The PowerShell runner supports the core loop, Claude/Codex providers, reviewer passes, shared notes, duration/cost limits, local commits, and GitHub PR creation/merge. Worktree management, self-update, and automatic CI/comment retry workflows are still Bash-runner only.
+
 ### Manual installation
 
 If you prefer to install manually:
@@ -102,12 +116,23 @@ chmod +x continuous-claude
 sudo mv continuous-claude /usr/local/bin/
 ```
 
+For PowerShell:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/AnandChowdhary/continuous-claude/main/continuous_claude.ps1 -OutFile continuous-claude.ps1
+pwsh ./continuous-claude.ps1 --help
+```
+
 To uninstall `continuous-claude`:
 
 ```bash
 rm ~/.local/bin/continuous-claude
 # or if you installed to /usr/local/bin:
 sudo rm /usr/local/bin/continuous-claude
+```
+
+```powershell
+rm ~/.local/bin/continuous-claude.ps1
 ```
 
 ### Prerequisites
@@ -118,7 +143,7 @@ Before using `continuous-claude`, you need:
    - **[Claude Code CLI](https://code.claude.com)** - Authenticate with `claude auth`
    - **[Codex CLI](https://help.openai.com/en/articles/11096431)** - Authenticate with `codex login`
 2. **[GitHub CLI](https://cli.github.com)** - Authenticate with `gh auth login`
-3. **jq** - Install with `brew install jq` (macOS) or `apt-get install jq` (Linux)
+3. **jq** - Install with `brew install jq` (macOS) or `apt-get install jq` (Linux). The PowerShell runner uses native JSON parsing and does not require `jq`.
 
 ### Usage
 
@@ -128,6 +153,9 @@ continuous-claude --prompt "add unit tests until all code is covered" --max-runs
 
 # Run the same loop with Codex CLI instead of Claude Code
 continuous-claude --provider codex --prompt "add unit tests until all code is covered" --max-runs 5
+
+# Native Windows PowerShell runner
+pwsh ~/.local/bin/continuous-claude.ps1 --prompt "add unit tests until all code is covered" --max-runs 5
 
 # Or explicitly specify the owner and repo
 continuous-claude --prompt "add unit tests until all code is covered" --max-runs 5 --owner AnandChowdhary --repo continuous-claude
@@ -143,6 +171,7 @@ continuous-claude --prompt "add unit tests until all code is covered" --max-dura
 
 - `-p, --prompt`: Task prompt for the selected AI coding agent (required)
 - `--provider`: AI coding provider, either `claude` or `codex` (default: `claude`)
+- `--review-provider`: AI coding provider for reviewer passes, either `claude` or `codex` (defaults to `--provider`)
 - `-m, --max-runs`: Maximum number of iterations, use `0` for infinite (required unless --max-cost or --max-duration is provided)
 - `--max-cost`: Maximum USD to spend (required unless --max-runs or --max-duration is provided)
 - `--max-duration`: Maximum duration to run (e.g., `2h`, `30m`, `1h30m`) (required unless --max-runs or --max-cost is provided)
@@ -154,6 +183,7 @@ continuous-claude --prompt "add unit tests until all code is covered" --max-dura
 - `--merge-strategy`: Merge strategy: `squash`, `merge`, or `rebase` (default: `squash`)
 - `--git-branch-prefix`: Prefix for git branch names (default: `continuous-claude/`)
 - `--notes-file`: Path to shared task notes file (default: `SHARED_TASK_NOTES.md`)
+- `--knowledge-file <file>`: Path to a durable project knowledge file to maintain across iterations, such as `CLAUDE.md`
 - `--disable-commits`: Disable automatic git commits, PR creation, and merging (useful for testing)
 - `--disable-branches`: Commit on current branch without creating branches or PRs
 - `--worktree <name>`: Run in a git worktree for parallel execution (creates if needed)
@@ -163,7 +193,12 @@ continuous-claude --prompt "add unit tests until all code is covered" --max-dura
 - `--dry-run`: Simulate execution without making changes
 - `--completion-signal <phrase>`: Phrase that agents output when entire project is complete (default: `CONTINUOUS_CLAUDE_PROJECT_COMPLETE`)
 - `--completion-threshold <num>`: Number of consecutive completion signals required to stop early (default: `3`)
+- `--stall-threshold <number>`: Pause after this many consecutive failures and append diagnostics to the notes file for human intervention
+- `--max-calls-per-hour <number>`: Throttle provider calls to this hourly ceiling, sleeping until capacity is available
+- `--error-threshold <number>`: Number of consecutive non-rate-limit errors before exiting (default: `3`)
 - `-r, --review-prompt [text]`: Run a reviewer pass after each iteration to validate changes. If you omit the text, Continuous Claude uses a comprehensive default review prompt that reviews the diff, runs available checks, simplifies changed code, and verifies the app where relevant.
+- `--command-retry-max <number>`: Maximum attempts for transient commit/push/PR-create commands before starting a new iteration (default: `3`)
+- `--command-retry-base-delay <seconds>`: Initial retry delay in seconds for transient commands, doubled after each failed attempt (default: `5`)
 
 Any additional flags you provide that are not recognized by `continuous-claude` will be automatically forwarded to the selected provider command. You can also use `--` to explicitly stop parsing `continuous-claude` options and forward the rest to the provider CLI.
 
@@ -177,6 +212,9 @@ continuous-claude -p "improve code quality" -m 5
 
 # Run 5 iterations with Codex CLI
 continuous-claude --provider codex -p "improve code quality" -m 5
+
+# Use Claude for implementation and Codex for the reviewer pass
+continuous-claude --provider claude --review-provider codex -p "add feature" -m 5 -r
 
 # Run infinitely until stopped
 continuous-claude -p "add unit tests until all code is covered" -m 0
@@ -215,6 +253,9 @@ continuous-claude -p "refactor code" -m 3 --git-branch-prefix "feature/"
 # Use custom notes file
 continuous-claude -p "add features" -m 5 --notes-file "PROJECT_CONTEXT.md"
 
+# Record durable project knowledge for future AI/human developers
+continuous-claude -p "modernize the API" -m 5 --knowledge-file "CLAUDE.md"
+
 # Test without creating commits or PRs
 continuous-claude -p "test changes" -m 2 --disable-commits
 
@@ -236,11 +277,20 @@ continuous-claude -p "add unit tests to all files" -m 50 --completion-threshold 
 # Use custom completion signal
 continuous-claude -p "fix all bugs" -m 20 --completion-signal "ALL_BUGS_FIXED" --completion-threshold 2
 
+# Pause and write diagnostics to SHARED_TASK_NOTES.md after repeated failures
+continuous-claude -p "stabilize CI" -m 20 --stall-threshold 3
+
+# Limit provider call throughput and keep retrying through rate-limit reset windows
+continuous-claude -p "fix flaky tests" -m 20 --max-calls-per-hour 80 --error-threshold 5
+
 # Use a reviewer to validate and fix changes after each iteration
 continuous-claude -p "add new feature" -m 5 -r "Run npm test and npm run lint, fix any failures"
 
 # Use the default reviewer prompt
 continuous-claude -p "add new feature" -m 5 -r
+
+# Retry transient commit/push/PR-create failures before abandoning the iteration
+continuous-claude -p "add new feature" -m 5 --command-retry-max 4 --command-retry-base-delay 10
 
 # Explicitly specify owner and repo (useful if git remote is not set up or not a GitHub repo)
 continuous-claude -p "add features" -m 5 --owner myuser --repo myproject

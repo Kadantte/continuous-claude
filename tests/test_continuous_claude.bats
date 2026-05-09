@@ -7,7 +7,14 @@ setup() {
     # Path to the script under test
     # BATS_TEST_DIRNAME is the directory containing the test file
     SCRIPT_PATH="$BATS_TEST_DIRNAME/../continuous_claude.sh"
+    PS_SCRIPT_PATH="$BATS_TEST_DIRNAME/../continuous_claude.ps1"
     export TESTING="true"
+}
+
+require_pwsh() {
+    if ! command -v pwsh >/dev/null 2>&1; then
+        skip "pwsh is not installed"
+    fi
 }
 
 @test "script has valid bash syntax" {
@@ -33,6 +40,135 @@ setup() {
     assert_output --partial "continuous-claude version"
 }
 
+@test "powershell script displays version" {
+    require_pwsh
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" --version
+
+    assert_success
+    assert_output --partial "continuous-claude PowerShell version"
+}
+
+@test "powershell script displays help" {
+    require_pwsh
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" --help
+
+    assert_success
+    assert_output --partial "Continuous Claude PowerShell"
+    assert_output --partial "--review-prompt [text]"
+    assert_output --partial "--review-provider <provider>"
+    assert_output --partial "--knowledge-file <file>"
+    assert_output --partial "--stall-threshold <number>"
+}
+
+@test "powershell dry run supports empty reviewer prompt" {
+    require_pwsh
+
+    local fake_bin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fake_bin"
+    printf '#!/bin/sh\nexit 0\n' > "$fake_bin/claude"
+    chmod +x "$fake_bin/claude"
+
+    PATH="$fake_bin:$PATH" run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        -p "test" -r -m 1 --disable-commits --disable-updates --dry-run
+
+    assert_success
+    assert_output --partial "Running reviewer pass"
+    assert_output --partial "Review the currently changed files"
+    assert_output --partial "Skipping commits"
+}
+
+@test "powershell reviewer pass can use Codex with Claude main provider" {
+    require_pwsh
+
+    local fake_bin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fake_bin"
+    printf '#!/bin/sh\nexit 0\n' > "$fake_bin/claude"
+    printf '#!/bin/sh\nexit 0\n' > "$fake_bin/codex"
+    chmod +x "$fake_bin/claude" "$fake_bin/codex"
+
+    PATH="$fake_bin:$PATH" run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        --provider claude --review-provider codex -p "test" -r -m 1 --disable-commits --disable-updates --dry-run
+
+    assert_success
+    assert_output --partial "Running Claude Code"
+    assert_output --partial "Running reviewer pass with Codex CLI"
+    assert_output --partial "Would run Codex CLI"
+    assert_output --partial "Skipping commits"
+}
+
+@test "powershell codex dry run returns completed turn" {
+    require_pwsh
+
+    local fake_bin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fake_bin"
+    printf '#!/bin/sh\nexit 0\n' > "$fake_bin/codex"
+    chmod +x "$fake_bin/codex"
+
+    PATH="$fake_bin:$PATH" run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        --provider codex -p "test" -m 1 --disable-commits --disable-updates --dry-run
+
+    assert_success
+    assert_output --partial "Running Codex CLI"
+    assert_output --partial "Work completed"
+    assert_output --partial "Skipping commits"
+}
+
+@test "powershell codex max-cost requires token rates" {
+    require_pwsh
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        --provider codex -p "test" --max-cost 5 --disable-commits
+
+    assert_failure
+    assert_output --partial "Codex CLI does not report USD cost"
+}
+
+@test "powershell Codex review provider max-cost requires token rates" {
+    require_pwsh
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        --provider claude --review-provider codex -p "test" -r --max-cost 5 --disable-commits
+
+    assert_failure
+    assert_output --partial "Codex CLI does not report USD cost"
+}
+
+@test "powershell rejects bash-only workflow flags" {
+    require_pwsh
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        -p "test" -m 1 --worktree windows
+
+    assert_failure
+    assert_output --partial "--worktree is not supported by the native PowerShell runner yet"
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        -p "test" -m 1 --stall-threshold 2
+
+    assert_failure
+    assert_output --partial "--stall-threshold is not supported by the native PowerShell runner yet"
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        -p "test" -m 1 --knowledge-file CLAUDE.md
+
+    assert_failure
+    assert_output --partial "--knowledge-file is not supported by the native PowerShell runner yet"
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        -p "test" -m 1 --max-calls-per-hour 80
+
+    assert_failure
+    assert_output --partial "--max-calls-per-hour is not supported by the native PowerShell runner yet"
+
+    run pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$PS_SCRIPT_PATH" \
+        -p "test" -m 1 --error-threshold 5
+
+    assert_failure
+    assert_output --partial "--error-threshold is not supported by the native PowerShell runner yet"
+}
+
 @test "parse_arguments handles required flags" {
     source "$SCRIPT_PATH"
     parse_arguments -p "test prompt" -m 5 --owner user --repo repo
@@ -55,6 +191,13 @@ setup() {
     parse_arguments --provider codex
 
     assert_equal "$AGENT_PROVIDER" "codex"
+}
+
+@test "parse_arguments handles review-provider flag" {
+    source "$SCRIPT_PATH"
+    parse_arguments --review-provider codex
+
+    assert_equal "$REVIEW_PROVIDER" "codex"
 }
 
 @test "parse_arguments forwards provider flags after separator" {
@@ -106,6 +249,81 @@ setup() {
     assert_equal "$DISABLE_UPDATES" "true"
 }
 
+@test "parse_arguments handles command retry flags" {
+    source "$SCRIPT_PATH"
+    parse_arguments --command-retry-max 4 --command-retry-base-delay 2
+
+    assert_equal "$COMMAND_RETRY_MAX_ATTEMPTS" "4"
+    assert_equal "$COMMAND_RETRY_BASE_DELAY" "2"
+}
+
+@test "parse_arguments handles adaptive rate limit flags" {
+    source "$SCRIPT_PATH"
+    parse_arguments --max-calls-per-hour 80 --error-threshold 5
+
+    assert_equal "$MAX_CALLS_PER_HOUR" "80"
+    assert_equal "$ERROR_THRESHOLD" "5"
+}
+
+@test "parse_arguments handles knowledge-file flag" {
+    source "$SCRIPT_PATH"
+    parse_arguments --knowledge-file CLAUDE.md
+
+    assert_equal "$KNOWLEDGE_FILE" "CLAUDE.md"
+}
+
+@test "validate_arguments fails with invalid max-calls-per-hour" {
+    source "$SCRIPT_PATH"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    MAX_CALLS_PER_HOUR="invalid"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --max-calls-per-hour must be a positive integer"
+}
+
+@test "validate_arguments fails with invalid error-threshold" {
+    source "$SCRIPT_PATH"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    ERROR_THRESHOLD="0"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --error-threshold must be a positive integer"
+}
+
+@test "validate_arguments fails with invalid command-retry-max" {
+    source "$SCRIPT_PATH"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    COMMAND_RETRY_MAX_ATTEMPTS="invalid"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --command-retry-max must be a positive integer"
+}
+
+@test "validate_arguments fails with invalid command-retry-base-delay" {
+    source "$SCRIPT_PATH"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    COMMAND_RETRY_BASE_DELAY="invalid"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --command-retry-base-delay must be a non-negative integer"
+}
+
 @test "render_notes_prompt uses current notes-file value" {
     source "$SCRIPT_PATH"
     NOTES_FILE="CUSTOM_NOTES.md"
@@ -114,6 +332,75 @@ setup() {
 
     assert_success
     assert_output 'Create a `CUSTOM_NOTES.md` file with relevant context and instructions for the next iteration.'
+}
+
+@test "render_knowledge_prompt uses current knowledge-file value" {
+    source "$SCRIPT_PATH"
+    KNOWLEDGE_FILE="CLAUDE.md"
+
+    run render_knowledge_prompt "$PROMPT_KNOWLEDGE_CREATE_NEW"
+
+    assert_success
+    assert_output 'Create a `CLAUDE.md` file with durable project knowledge learned during this iteration.'
+}
+
+@test "execute_single_iteration includes durable knowledge context and update prompt" {
+    source "$SCRIPT_PATH"
+
+    PROMPT="Improve the project"
+    ENABLE_COMMITS="false"
+    NOTES_FILE="$BATS_TEST_TMPDIR/notes.md"
+    KNOWLEDGE_FILE="$BATS_TEST_TMPDIR/CLAUDE.md"
+    ERROR_LOG="$BATS_TEST_TMPDIR/error.log"
+    local prompt_file="$BATS_TEST_TMPDIR/prompt.txt"
+
+    echo "Next step: add tests" > "$NOTES_FILE"
+    echo "Use pnpm test for verification." > "$KNOWLEDGE_FILE"
+
+    function git() {
+        case "$1 $2 $3" in
+            "rev-parse --abbrev-ref HEAD")
+                echo "main"
+                return 0
+                ;;
+            "rev-parse --git-dir ")
+                return 0
+                ;;
+            "diff --quiet --ignore-submodules=dirty")
+                return 0
+                ;;
+            "diff --cached --quiet")
+                return 0
+                ;;
+            "ls-files --others --exclude-standard")
+                echo ""
+                return 0
+                ;;
+        esac
+        return 0
+    }
+    export -f git
+
+    function run_agent_iteration() {
+        printf "%s" "$1" > "$prompt_file"
+        echo '{"result":"Work done","total_cost_usd":0}'
+        return 0
+    }
+    export -f run_agent_iteration
+    export prompt_file
+
+    run execute_single_iteration 1
+
+    assert_success
+    assert [ -f "$prompt_file" ]
+    run grep -q "DURABLE PROJECT KNOWLEDGE" "$prompt_file"
+    assert_success
+    run grep -q "Use pnpm test for verification." "$prompt_file"
+    assert_success
+    run grep -q "DURABLE KNOWLEDGE RECORDING" "$prompt_file"
+    assert_success
+    run grep -q "Update the \`$KNOWLEDGE_FILE\` file with durable project knowledge" "$prompt_file"
+    assert_success
 }
 
 @test "validate_arguments fails without prompt" {
@@ -158,9 +445,37 @@ setup() {
     assert_output --partial "Error: --provider must be one of: claude, codex"
 }
 
+@test "validate_arguments fails with invalid review provider" {
+    source "$SCRIPT_PATH"
+    REVIEW_PROVIDER="invalid"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --review-provider must be one of: claude, codex"
+}
+
 @test "validate_arguments requires Codex token rates for max-cost" {
     source "$SCRIPT_PATH"
     AGENT_PROVIDER="codex"
+    PROMPT="test"
+    MAX_COST="5.00"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Codex CLI does not report USD cost"
+}
+
+@test "validate_arguments requires Codex token rates for review provider max-cost" {
+    source "$SCRIPT_PATH"
+    AGENT_PROVIDER="claude"
+    REVIEW_PROVIDER="codex"
+    REVIEW_PROMPT="review"
     PROMPT="test"
     MAX_COST="5.00"
     GITHUB_OWNER="user"
@@ -260,6 +575,25 @@ setup() {
 
     assert_failure
     assert_output --partial "Error: Codex CLI is not installed"
+}
+
+@test "validate_requirements fails when codex is missing for review provider" {
+    function command() {
+        if [ "$2" == "codex" ]; then
+            return 1
+        fi
+        return 0
+    }
+    export -f command
+
+    source "$SCRIPT_PATH"
+    AGENT_PROVIDER="claude"
+    REVIEW_PROVIDER="codex"
+    REVIEW_PROMPT="review"
+    run validate_requirements
+
+    assert_failure
+    assert_output --partial "Error: reviewer provider Codex CLI is not installed"
 }
 
 @test "validate_requirements fails when jq is missing" {
@@ -463,11 +797,19 @@ setup() {
     assert_equal "$COMPLETION_THRESHOLD" "5"
 }
 
+@test "parse_arguments handles stall-threshold flag" {
+    source "$SCRIPT_PATH"
+    parse_arguments --stall-threshold 4
+
+    assert_equal "$STALL_THRESHOLD" "4"
+}
+
 @test "parse_arguments sets default completion values" {
     source "$SCRIPT_PATH"
     
     assert_equal "$COMPLETION_SIGNAL" "CONTINUOUS_CLAUDE_PROJECT_COMPLETE"
     assert_equal "$COMPLETION_THRESHOLD" "3"
+    assert_equal "$STALL_THRESHOLD" ""
 }
 
 @test "validate_arguments fails with invalid completion-threshold" {
@@ -494,6 +836,32 @@ setup() {
     run validate_arguments
     assert_failure
     assert_output --partial "Error: --completion-threshold must be a positive integer"
+}
+
+@test "validate_arguments fails with invalid stall-threshold" {
+    source "$SCRIPT_PATH"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    STALL_THRESHOLD="invalid"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --stall-threshold must be a positive integer"
+}
+
+@test "validate_arguments fails with zero stall-threshold" {
+    source "$SCRIPT_PATH"
+    PROMPT="test"
+    MAX_RUNS="5"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    STALL_THRESHOLD="0"
+
+    run validate_arguments
+    assert_failure
+    assert_output --partial "Error: --stall-threshold must be a positive integer"
 }
 
 @test "validate_arguments passes with valid completion-threshold" {
@@ -619,6 +987,77 @@ setup() {
     assert_success
     assert_output --partial "Completion signal detected (1/2)"
     assert_output --partial "Tokens: input 100, cached input 0, output 20"
+}
+
+@test "positive completion heuristic increments counter when repo is clean" {
+    source "$SCRIPT_PATH"
+
+    completion_signal_count=0
+    total_cost=0
+    COMPLETION_THRESHOLD=3
+    ENABLE_COMMITS="false"
+
+    local result='{"result": "All scoped tasks complete.", "total_cost_usd": 0.1}'
+
+    function git() {
+        case "$1 $2 $3" in
+            "rev-parse --git-dir")
+                return 0
+                ;;
+            "diff --quiet --ignore-submodules=dirty")
+                return 0
+                ;;
+            "diff --cached --quiet")
+                return 0
+                ;;
+            "ls-files --others --exclude-standard")
+                echo ""
+                ;;
+        esac
+        return 0
+    }
+    export -f git
+
+    run handle_iteration_success "(1/3)" "$result" "" "main"
+
+    assert_success
+    assert_output --partial "Positive completion heuristic detected (1/3)"
+}
+
+@test "positive completion heuristic waits when repo has pending changes" {
+    source "$SCRIPT_PATH"
+
+    completion_signal_count=1
+    total_cost=0
+    COMPLETION_THRESHOLD=3
+    ENABLE_COMMITS="false"
+
+    local result='{"result": "All scoped tasks complete.", "total_cost_usd": 0.1}'
+
+    function git() {
+        case "$1 $2 $3" in
+            "rev-parse --git-dir")
+                return 0
+                ;;
+            "diff --quiet --ignore-submodules=dirty")
+                return 1
+                ;;
+            "diff --cached --quiet")
+                return 0
+                ;;
+            "ls-files --others --exclude-standard")
+                echo ""
+                ;;
+        esac
+        return 0
+    }
+    export -f git
+
+    run handle_iteration_success "(1/3)" "$result" "" "main"
+
+    assert_success
+    assert_output --partial "Completion signal not found, resetting counter"
+    refute_output --partial "Positive completion heuristic detected"
 }
 
 @test "show_completion_summary shows signal message" {
@@ -835,6 +1274,25 @@ setup() {
     rm -f "$error_log"
 }
 
+@test "run_reviewer_iteration uses configured review provider" {
+    source "$SCRIPT_PATH"
+    AGENT_PROVIDER="claude"
+    REVIEW_PROVIDER="codex"
+    DRY_RUN="true"
+
+    local error_log
+    error_log=$(mktemp)
+
+    run run_reviewer_iteration "(1/1)" "Review the branch" "$error_log"
+
+    rm -f "$error_log"
+
+    assert_success
+    assert_output --partial "Running reviewer pass with Codex CLI"
+    assert_output --partial "Would run Codex CLI"
+    assert_equal "$AGENT_PROVIDER" "claude"
+}
+
 @test "run_agent_iteration clears stale Codex error log before JSON error extraction" {
     source "$SCRIPT_PATH"
     AGENT_PROVIDER="codex"
@@ -878,6 +1336,180 @@ setup() {
     assert_success
     run grep -q "commit please" "$args_file"
     assert_success
+}
+
+@test "detect_rate_limit_wait_seconds honors retry-after seconds" {
+    source "$SCRIPT_PATH"
+
+    run detect_rate_limit_wait_seconds "HTTP 429 rate_limit_error retry-after: 120"
+
+    assert_success
+    assert_output "120"
+}
+
+@test "detect_rate_limit_wait_seconds parses Claude reset time" {
+    source "$SCRIPT_PATH"
+
+    function date() {
+        if [ "$1" = "+%H %M %S" ]; then
+            echo "04 30 00"
+            return 0
+        fi
+        command date "$@"
+    }
+    export -f date
+
+    run detect_rate_limit_wait_seconds "5-hour limit reached · resets 5am (Europe/Amsterdam) · /upgrade"
+
+    assert_success
+    assert_output "1800"
+}
+
+@test "record_agent_call throttles at max-calls-per-hour" {
+    source "$SCRIPT_PATH"
+
+    MAX_CALLS_PER_HOUR=2
+    RATE_LIMIT_CALL_LOG="$BATS_TEST_TMPDIR/calls.log"
+    RATE_LIMIT_ERROR_LOG="$BATS_TEST_TMPDIR/errors.log"
+    RATE_LIMIT_COST_LOG="$BATS_TEST_TMPDIR/cost.log"
+    printf "1000\n1100\n" > "$RATE_LIMIT_CALL_LOG"
+    : > "$RATE_LIMIT_ERROR_LOG"
+    : > "$RATE_LIMIT_COST_LOG"
+    : > "$BATS_TEST_TMPDIR/sleeps"
+
+    function date() {
+        if [ "$1" = "+%s" ]; then
+            echo "1200"
+            return 0
+        fi
+        command date "$@"
+    }
+    function sleep() {
+        echo "$1" >> "$BATS_TEST_TMPDIR/sleeps"
+    }
+    export -f date sleep
+
+    run record_agent_call "test agent"
+
+    assert_success
+    assert_output --partial "test agent throttled for 56m40s (limit 2/hr"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/sleeps")" "3400"
+}
+
+@test "handle_iteration_error sleeps through Claude reset limits" {
+    source "$SCRIPT_PATH"
+
+    ERROR_THRESHOLD=1
+    ERROR_LOG="$BATS_TEST_TMPDIR/error.log"
+    RATE_LIMIT_CALL_LOG="$BATS_TEST_TMPDIR/calls.log"
+    RATE_LIMIT_ERROR_LOG="$BATS_TEST_TMPDIR/errors.log"
+    RATE_LIMIT_COST_LOG="$BATS_TEST_TMPDIR/cost.log"
+    echo "5-hour limit reached · resets 5am (Europe/Amsterdam) · /upgrade" > "$ERROR_LOG"
+    : > "$RATE_LIMIT_CALL_LOG"
+    : > "$RATE_LIMIT_ERROR_LOG"
+    : > "$RATE_LIMIT_COST_LOG"
+    : > "$BATS_TEST_TMPDIR/sleeps"
+
+    function date() {
+        case "$1" in
+            "+%s")
+                echo "1000"
+                ;;
+            "+%H %M %S")
+                echo "04 30 00"
+                ;;
+            *)
+                command date "$@"
+                ;;
+        esac
+    }
+    function sleep() {
+        echo "$1" >> "$BATS_TEST_TMPDIR/sleeps"
+    }
+    export -f date sleep
+
+    run handle_iteration_error "(5/22)" "exit_code" ""
+
+    assert_failure
+    assert_output --partial "Rate limit detected in exit_code; throttled for 30m"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/sleeps")" "1800"
+}
+
+@test "handle_iteration_error uses custom error-threshold for non-rate-limit failures" {
+    source "$SCRIPT_PATH"
+
+    ERROR_THRESHOLD=2
+    error_count=1
+    ERROR_LOG="$BATS_TEST_TMPDIR/error.log"
+    RATE_LIMIT_CALL_LOG="$BATS_TEST_TMPDIR/calls.log"
+    RATE_LIMIT_ERROR_LOG="$BATS_TEST_TMPDIR/errors.log"
+    RATE_LIMIT_COST_LOG="$BATS_TEST_TMPDIR/cost.log"
+    echo "ordinary failure" > "$ERROR_LOG"
+    : > "$RATE_LIMIT_CALL_LOG"
+    : > "$RATE_LIMIT_ERROR_LOG"
+    : > "$RATE_LIMIT_COST_LOG"
+
+    run handle_iteration_error "(2/5)" "exit_code" ""
+
+    assert_failure
+    assert_output --partial "Fatal: 2 consecutive errors occurred. Exiting."
+}
+
+@test "handle_iteration_error writes notes and exits at stall threshold" {
+    source "$SCRIPT_PATH"
+
+    STALL_THRESHOLD=2
+    error_count=1
+    extra_iterations=0
+    NOTES_FILE="$BATS_TEST_TMPDIR/health-notes.md"
+    ERROR_LOG="$BATS_TEST_TMPDIR/error.log"
+    echo "lint failed in src/app.js" > "$ERROR_LOG"
+
+    run handle_iteration_error "(2/5)" "exit_code" ""
+
+    assert_failure
+    assert_output --partial "Health stall threshold reached (2/2 consecutive failures)"
+    assert_output --partial "Wrote stall diagnostics to $NOTES_FILE"
+    assert [ -f "$NOTES_FILE" ]
+    run grep -q "Health pause" "$NOTES_FILE"
+    assert_success
+    run grep -q "lint failed in src/app.js" "$NOTES_FILE"
+    assert_success
+}
+
+@test "run_with_command_retry retries with exponential backoff" {
+    source "$SCRIPT_PATH"
+    COMMAND_RETRY_MAX_ATTEMPTS=3
+    COMMAND_RETRY_BASE_DELAY=2
+
+    echo "0" > "$BATS_TEST_TMPDIR/retry_count"
+    : > "$BATS_TEST_TMPDIR/sleeps"
+
+    function flaky_command() {
+        local count
+        count=$(cat "$BATS_TEST_TMPDIR/retry_count")
+        count=$((count + 1))
+        echo "$count" > "$BATS_TEST_TMPDIR/retry_count"
+        if [ "$count" -lt 3 ]; then
+            echo "rate limited"
+            return 1
+        fi
+        echo "ok"
+        return 0
+    }
+
+    function sleep() {
+        echo "$1" >> "$BATS_TEST_TMPDIR/sleeps"
+        return 0
+    }
+    export -f flaky_command sleep
+
+    run run_with_command_retry "test command" flaky_command
+
+    assert_success
+    assert_output --partial "ok"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/retry_count")" "3"
+    assert_equal "$(tr '\n' ',' < "$BATS_TEST_TMPDIR/sleeps")" "2,4,"
 }
 
 @test "get_latest_version returns version when gh is available" {
@@ -1790,6 +2422,122 @@ setup() {
     refute_output --partial "claude should not be called"
 }
 
+@test "continuous_claude_commit retries transient PR creation failures" {
+    source "$SCRIPT_PATH"
+
+    ENABLE_COMMITS="true"
+    DRY_RUN="false"
+    GITHUB_OWNER="user"
+    GITHUB_REPO="repo"
+    COMMAND_RETRY_MAX_ATTEMPTS=2
+    COMMAND_RETRY_BASE_DELAY=1
+
+    function git() {
+        case "$1 $2 $3 $4" in
+            "rev-parse --git-dir"*)
+                return 0
+                ;;
+            "diff --quiet --ignore-submodules=dirty"*)
+                return 0
+                ;;
+            "diff --cached --quiet --ignore-submodules=dirty"*)
+                return 0
+                ;;
+            "ls-files --others --exclude-standard"*)
+                echo ""
+                ;;
+            "rev-list --count main..test-branch"*)
+                echo "1"
+                ;;
+            "log -1 --format=%B"*)
+                echo "Test commit message"
+                ;;
+            "push -u origin test-branch"*)
+                return 0
+                ;;
+            checkout*|branch*)
+                return 0
+                ;;
+        esac
+        return 0
+    }
+    export -f git
+
+    echo "0" > "$BATS_TEST_TMPDIR/pr_create_count"
+    function gh() {
+        if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+            local count
+            count=$(cat "$BATS_TEST_TMPDIR/pr_create_count")
+            count=$((count + 1))
+            echo "$count" > "$BATS_TEST_TMPDIR/pr_create_count"
+            if [ "$count" -eq 1 ]; then
+                echo "GraphQL: API rate limit already exceeded" >&2
+                return 1
+            fi
+            echo "https://github.com/user/repo/pull/123"
+            return 0
+        fi
+        return 1
+    }
+    export -f gh
+
+    function wait_for_pr_checks() { return 0; }
+    function merge_pr_and_cleanup() { return 0; }
+    function sleep() { return 0; }
+    export -f wait_for_pr_checks merge_pr_and_cleanup sleep
+
+    run continuous_claude_commit "(1/1)" "test-branch" "main"
+
+    assert_success
+    assert_output --partial "Retrying (1/1) create PR in 1s"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/pr_create_count")" "2"
+}
+
+@test "merge_pr_and_cleanup surfaces GitHub plan restriction errors" {
+    source "$SCRIPT_PATH"
+
+    MERGE_STRATEGY="squash"
+
+    function gh() {
+        if [ "$1" = "pr" ] && [ "$2" = "update-branch" ]; then
+            echo "already up-to-date"
+            return 1
+        fi
+        if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+            echo "HTTP 403: Upgrade to GitHub Pro or make this repository public to enable this feature." >&2
+            return 1
+        fi
+        return 1
+    }
+    export -f gh
+
+    run merge_pr_and_cleanup "123" "owner" "repo" "test-branch" "(1/1)" "main"
+
+    assert_failure
+    assert_output --partial "Failed to merge PR: HTTP 403: Upgrade to GitHub Pro"
+    assert_output --partial "not a merge queue failure"
+}
+
+@test "handle_iteration_success reports PR workflow failure instead of merge queue failure" {
+    source "$SCRIPT_PATH"
+
+    ENABLE_COMMITS="true"
+    DISABLE_BRANCHES="false"
+    error_count=0
+    extra_iterations=0
+
+    function continuous_claude_commit() {
+        return 1
+    }
+    export -f continuous_claude_commit
+
+    run handle_iteration_success "(1/1)" '{"result":"ok","total_cost_usd":0}' "test-branch" "main"
+
+    assert_failure
+    assert_output --partial "PR workflow failed"
+    refute_output --partial "PR merge queue failed"
+}
+
 @test "wait_for_pr_checks prints initial waiting message once" {
     source "$SCRIPT_PATH"
     
@@ -2104,7 +2852,8 @@ setup() {
     # - has_changes will detect untracked files in parent repo
     # - After claude commits, verification will pass (ignoring dirty submodule)
     # - ls-files initially returns untracked files, then returns empty after commit
-    local commit_called=false
+    local commit_state="$BATS_TEST_TMPDIR/continuous_commit_called"
+    echo "false" > "$commit_state"
     function git() {
         case "$1 $2 $3 $4 $5" in
             "rev-parse --git-dir"*)
@@ -2121,7 +2870,7 @@ setup() {
                 ;;
             "ls-files --others"*)
                 # Return untracked files before commit, empty after
-                if [ "$commit_called" = "false" ]; then
+                if [ "$(cat "$commit_state")" = "false" ]; then
                     echo "newfile.txt"  # Simulates untracked file in parent repo
                 else
                     echo ""  # No untracked files after commit
@@ -2140,16 +2889,14 @@ setup() {
         return 0
     }
     export -f git
-    
-    commit_called=false
-    
+
     # Mock claude to succeed and mark that commit was called
     function claude() {
-        commit_called=true
+        echo "true" > "$commit_state"
         return 0
     }
     export -f claude
-    export commit_called
+    export commit_state
     
     # Run the function - it may fail on PR creation but commit verification should pass
     run continuous_claude_commit "(1/1)" "test-branch" "main"
@@ -2167,7 +2914,8 @@ setup() {
     DRY_RUN="false"
     
     # Mock git to simulate a repository with changes in parent repo AND a dirty submodule
-    local commit_called=false
+    local commit_state="$BATS_TEST_TMPDIR/current_branch_commit_called"
+    echo "false" > "$commit_state"
     function git() {
         case "$1 $2 $3 $4 $5" in
             "rev-parse --git-dir"*)
@@ -2181,7 +2929,7 @@ setup() {
                 ;;
             "ls-files --others"*)
                 # Return untracked files before commit, empty after
-                if [ "$commit_called" = "false" ]; then
+                if [ "$(cat "$commit_state")" = "false" ]; then
                     echo "newfile.txt"  # Simulates untracked file in parent repo
                 else
                     echo ""  # No untracked files after commit
@@ -2194,16 +2942,14 @@ setup() {
         return 0
     }
     export -f git
-    
-    commit_called=false
-    
+
     # Mock claude to succeed and mark that commit was called
     function claude() {
-        commit_called=true
+        echo "true" > "$commit_state"
         return 0
     }
     export -f claude
-    export commit_called
+    export commit_state
     
     # Run the function
     run commit_on_current_branch "(1/1)"
@@ -2211,6 +2957,68 @@ setup() {
     # Should succeed because --ignore-submodules=dirty allows dirty submodules
     assert_success
     assert_output --partial "Committed: Test commit"
+}
+
+@test "commit_on_current_branch retries transient commit failures" {
+    source "$SCRIPT_PATH"
+
+    DRY_RUN="false"
+    COMMAND_RETRY_MAX_ATTEMPTS=2
+    COMMAND_RETRY_BASE_DELAY=1
+
+    local commit_state="$BATS_TEST_TMPDIR/current_branch_retry_committed"
+    local commit_count="$BATS_TEST_TMPDIR/current_branch_retry_count"
+    echo "false" > "$commit_state"
+    echo "0" > "$commit_count"
+
+    function git() {
+        case "$1 $2 $3 $4 $5" in
+            "rev-parse --git-dir"*)
+                return 0
+                ;;
+            "diff --quiet"*)
+                if [ "$(cat "$commit_state")" = "true" ]; then
+                    return 0
+                fi
+                return 1
+                ;;
+            "diff --cached --quiet"*)
+                return 0
+                ;;
+            "ls-files --others"*)
+                echo ""
+                ;;
+            "log -1 --format=%s"*)
+                echo "Retry commit"
+                ;;
+        esac
+        return 0
+    }
+    export -f git
+
+    function claude() {
+        local count
+        count=$(cat "$commit_count")
+        count=$((count + 1))
+        echo "$count" > "$commit_count"
+        if [ "$count" -eq 1 ]; then
+            echo "temporary commit failure" >&2
+            return 1
+        fi
+
+        echo "true" > "$commit_state"
+        return 0
+    }
+    function sleep() { return 0; }
+    export -f claude sleep
+    export commit_state commit_count
+
+    run commit_on_current_branch "(1/1)"
+
+    assert_success
+    assert_output --partial "Retrying (1/1) commit command in 1s"
+    assert_output --partial "Committed: Retry commit"
+    assert_equal "$(cat "$commit_count")" "2"
 }
 
 @test "commit_on_current_branch uses Codex provider when selected" {
@@ -2609,6 +3417,12 @@ setup() {
     run show_help
     assert_output --partial "--disable-comment-review"
     assert_output --partial "--comment-review-max"
+    assert_output --partial "--command-retry-max"
+    assert_output --partial "--command-retry-base-delay"
+    assert_output --partial "--knowledge-file"
+    assert_output --partial "--stall-threshold"
+    assert_output --partial "--max-calls-per-hour"
+    assert_output --partial "--error-threshold"
     assert_output --partial "--review-prompt [text]"
     assert_output --partial "Uses a comprehensive default review prompt"
 }
